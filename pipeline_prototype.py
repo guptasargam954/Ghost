@@ -1,0 +1,89 @@
+import os, csv, json, re, glob, sqlite3, base64, zlib
+from collections import defaultdict
+from datetime import datetime
+
+repo = 'repo/hackerrank-orchestrate-october26-main'
+
+# Operation ordering
+OP_ORDER = {
+    'REPORT_REMAINING_RECORD': 1,
+    'REPORT_EXPOSED_PII': 2,
+    'REPORT_ACTIVE_DATA_FLOW': 3,
+    'REPORT_RESTORE_RISK': 4,
+    'DISABLE_DATA_FLOW': 5,
+    'BLOCK_RESTORE': 6,
+    'DELETE_RECORD': 7,
+    'REDACT_RECORD': 8,
+    'ANONYMIZE_RECORD': 9,
+    'VERIFY_RECORD_ABSENT': 10,
+    'VERIFY_RECORD_PRESENT': 11,
+    'VERIFY_RECORD_REDACTED': 12,
+    'VERIFY_RECORD_ANONYMIZED': 13,
+    'VERIFY_DATA_FLOW_DISABLED': 14,
+    'VERIFY_RESTORE_BLOCKED': 15,
+}
+
+PHASE_ORDER = {
+    'FINDING': 1,
+    'REMEDIATION': 2,
+    'VERIFICATION': 3,
+}
+
+def step_sort_key(s):
+    return (PHASE_ORDER[s['phase']], OP_ORDER[s['operation']], s['system_id'], s['resource_id'])
+
+# 1. Load users & identities
+with open(f'{repo}/dataset/user_identities.csv') as f:
+    users = {r['user_id']: r for r in csv.DictReader(f)}
+    email_to_uid = {r['email'].strip().lower(): r['user_id'] for r in users.values()}
+
+with open(f'{repo}/dataset/user_audit_log.csv') as f:
+    audit_rows = list(csv.DictReader(f))
+    for r in audit_rows:
+        if r['field_name'] == 'email':
+            email_to_uid[r['old_value'].strip().lower()] = r['user_id']
+            email_to_uid[r['new_value'].strip().lower()] = r['user_id']
+
+user_idents = {}
+for uid, u in users.items():
+    user_idents[uid] = {
+        'uid': uid,
+        'emails': {u['email'].strip().lower()},
+        'phones': {u['phone'].strip()},
+        'names': {u['name'].strip()},
+        'hashes': {u['email_hash'].strip().lower()}
+    }
+
+for r in audit_rows:
+    uid = r['user_id']
+    if uid in user_idents:
+        fn = r['field_name']
+        if fn == 'email':
+            user_idents[uid]['emails'].add(r['old_value'].strip().lower())
+            user_idents[uid]['emails'].add(r['new_value'].strip().lower())
+        elif fn == 'phone':
+            user_idents[uid]['phones'].add(r['old_value'].strip())
+            user_idents[uid]['phones'].add(r['new_value'].strip())
+        elif fn == 'name':
+            user_idents[uid]['names'].add(r['old_value'].strip())
+            user_idents[uid]['names'].add(r['new_value'].strip())
+
+# Evidence manifest
+with open(f'{repo}/dataset/evidence_files.csv') as f:
+    ev_files = {r['file_id']: r for r in csv.DictReader(f)}
+    path_to_ev = {r['file_path']: r['file_id'] for r in ev_files.values()}
+
+# System activity
+with open(f'{repo}/dataset/system_activity.csv') as f:
+    acts = list(csv.DictReader(f))
+
+# Map LINK_RESOURCE_IDENTITY
+for a in acts:
+    if a['event_type'] == 'LINK_RESOURCE_IDENTITY':
+        m = re.search(r'to (.*?) and (user_\d+)', a['details'])
+        if m:
+            em, uid = m.group(1), m.group(2)
+            if uid in user_idents:
+                user_idents[uid]['emails'].add(em.strip().lower())
+
+print('Setup complete.')
